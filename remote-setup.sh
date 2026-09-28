@@ -393,41 +393,38 @@ LABEL org.opencontainers.image.description="AmneziaWG VPN Server"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Инструменты для сборки C-кода и git для клонирования репозитория
+# Инструменты для сборки C-кода, Go и git
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         git \
         pkg-config \
         ca-certificates \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Клонируем amneziawg-tools (форк wireguard-tools с поддержкой AWG-параметров)
-# --depth 1 — только последний коммит, не тянем историю
-#
-# ВАЖНО: Makefile собирает бинарник с именем 'wg' (не 'awg'),
-# поэтому мы используем 'make install DESTDIR' и нормализуем имена.
+# ── Устанавливаем Go (нужен для сборки amneziawg-go) ─────────────────────────
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+    && wget -q "https://go.dev/dl/go1.22.5.linux-${ARCH}.tar.gz" -O /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+ENV PATH="$PATH:/usr/local/go/bin"
+
+# ── Собираем amneziawg-tools (awg + awg-quick) ───────────────────────────────
 RUN git clone --depth 1 \
         https://github.com/amnezia-vpn/amneziawg-tools.git \
         /tmp/awg-src \
-    # Компилируем всё: бинарник + скрипт wg-quick/awg-quick
     && make -C /tmp/awg-src/src \
-    # Устанавливаем в временный DESTDIR — это правильно раскладывает все файлы
     && make -C /tmp/awg-src/src install DESTDIR=/tmp/awg-inst \
-    # Выводим список установленных файлов (для отладки)
     && echo '=== Installed files ===' && find /tmp/awg-inst -type f \
-    # Нормализуем имена в /tmp/awg-bin/: wg→awg, wg-quick→awg-quick
     && mkdir -p /tmp/awg-bin \
-    # Ищем главный бинарник: сначала 'awg', затем 'wg'
     && for f in awg wg; do \
          found=$(find /tmp/awg-inst -type f -name "$f" ! -name '*-*' | head -1); \
          [ -n "$found" ] && cp "$found" /tmp/awg-bin/awg && break; \
        done \
-    # Ищем скрипт: сначала 'awg-quick', затем 'wg-quick'
     && for f in awg-quick wg-quick; do \
          found=$(find /tmp/awg-inst -type f -name "$f" | head -1); \
          [ -n "$found" ] && cp "$found" /tmp/awg-bin/awg-quick && break; \
        done \
-    # Если awg-quick вообще не нашёлся — создаём минимальный враппер
     && if [ ! -f /tmp/awg-bin/awg-quick ]; then \
          printf '#!/bin/sh\nexec wg-quick "$@"\n' > /tmp/awg-bin/awg-quick; \
          echo 'WARN: awg-quick not found, created fallback wrapper'; \
@@ -436,13 +433,23 @@ RUN git clone --depth 1 \
     && chmod +x /tmp/awg-bin/awg /tmp/awg-bin/awg-quick \
     && echo '=== Final binaries ===' && ls -la /tmp/awg-bin/
 
-# ── Финальный образ: только рантайм-зависимости ──────────────────────────────
-# Компилятор и git не включаются — финальный образ остаётся лёгким.
+# ── Собираем amneziawg-go (userspace AWG без модуля ядра) ────────────────────
+# Используется как fallback когда модуль ядра amneziawg недоступен.
+# Поддерживает все AWG-параметры: Jc, Jmin, Jmax, S1, S2, H1-H4.
+RUN git clone --depth 1 \
+        https://github.com/amnezia-vpn/amneziawg-go.git \
+        /tmp/awg-go-src \
+    && cd /tmp/awg-go-src \
+    && make \
+    && cp amneziawg-go /tmp/awg-bin/amneziawg-go \
+    && chmod +x /tmp/awg-bin/amneziawg-go \
+    && echo 'amneziawg-go built:' && /tmp/awg-bin/amneziawg-go --version 2>/dev/null || true
+
+# ── Финальный образ ───────────────────────────────────────────────────────────
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Рантайм: сетевые утилиты и iptables для NAT
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iptables \
         iproute2 \
@@ -452,24 +459,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем нормализованные бинарники из стадии builder:
-# awg       — основной бинарник (аналог wg, с поддержкой Jc/Jmin/Jmax/S1/S2/H1-H4)
-# awg-quick — скрипт управления интерфейсом (аналог wg-quick, читает AWG-поля)
-COPY --from=builder /tmp/awg-bin/awg       /usr/local/bin/awg
-COPY --from=builder /tmp/awg-bin/awg-quick  /usr/local/bin/awg-quick
-RUN chmod +x /usr/local/bin/awg /usr/local/bin/awg-quick \
+# awg, awg-quick — инструменты AmneziaWG
+# amneziawg-go  — userspace backend (fallback без модуля ядра)
+COPY --from=builder /tmp/awg-bin/awg          /usr/local/bin/awg
+COPY --from=builder /tmp/awg-bin/awg-quick    /usr/local/bin/awg-quick
+COPY --from=builder /tmp/awg-bin/amneziawg-go /usr/local/bin/amneziawg-go
+RUN chmod +x /usr/local/bin/awg /usr/local/bin/awg-quick /usr/local/bin/amneziawg-go \
     && echo 'awg version:' && awg --version || true
 
-# Копируем точку входа контейнера
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Конфиги монтируются снаружи (с хоста)
 VOLUME ["/etc/amnezia/amneziawg"]
-
-# AmneziaWG слушает на UDP-порту (при network_mode: host порт открыт на хосте)
 EXPOSE 51820/udp
-
 ENTRYPOINT ["/entrypoint.sh"]
 DOCKERFILE_EOF
 
@@ -502,13 +504,24 @@ fi
 
 echo "[ENTRY] Поднимаем интерфейс wg0..."
 
-# Пробуем запустить через awg-quick (AmneziaWG-вариант wg-quick)
-# Если awg-quick недоступен — fallback на стандартный wg-quick
-if command -v awg-quick &>/dev/null; then
-    awg-quick up "${WG_CONF}" && echo "[ENTRY] wg0 поднят через awg-quick." \
+# Пробуем загрузить модуль ядра amneziawg (лучшая производительность)
+if modprobe amneziawg 2>/dev/null; then
+    echo "[ENTRY] Модуль amneziawg загружен — используем kernel mode."
+    awg-quick up "${WG_CONF}" \
+        && echo "[ENTRY] wg0 поднят через awg-quick (kernel mode)." \
         || echo "[ENTRY] WARN: awg-quick up завершился с ошибкой."
+elif command -v amneziawg-go &>/dev/null; then
+    # Kernel module недоступен — используем userspace реализацию AWG.
+    # amneziawg-go поддерживает все параметры обфускации: Jc, Jmin, Jmax, S1, S2, H1-H4.
+    echo "[ENTRY] Модуль ядра недоступен — используем amneziawg-go (userspace AWG)."
+    WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go awg-quick up "${WG_CONF}" \
+        && echo "[ENTRY] wg0 поднят через amneziawg-go (userspace)." \
+        || echo "[ENTRY] WARN: amneziawg-go up завершился с ошибкой."
 else
-    wg-quick up "${WG_CONF}" && echo "[ENTRY] wg0 поднят через wg-quick (fallback)." \
+    echo "[ENTRY] WARN: AWG недоступен. Fallback на стандартный wireguard (без обфускации)."
+    modprobe wireguard 2>/dev/null || true
+    wg-quick up "${WG_CONF}" \
+        && echo "[ENTRY] wg0 поднят через wg-quick (стандартный WG, без обфускации)." \
         || echo "[ENTRY] WARN: wg-quick up завершился с ошибкой."
 fi
 

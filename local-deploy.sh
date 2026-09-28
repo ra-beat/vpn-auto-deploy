@@ -396,17 +396,22 @@ success "remote-setup.sh скопирован."
 # ==============================================================================
 header "Шаг 2.5: Проверка готовности сервера"
 
-info "Проверяем модуль ядра, контейнер, интерфейс wg0, порт 51820..."
+warn "Если модуль amneziawg не установлен — сборка займёт 5-10 минут. Подождите."
 echo ""
 
-SETUP_OUTPUT=$(remote_exec_output "bash /tmp/remote-setup.sh --setup-kernel") ; SETUP_EXIT=$?
+spinner_start "Проверяем и настраиваем сервер (модуль ядра, контейнер, wg0, порт)..."
+SETUP_EXIT=0
+SETUP_OUTPUT=$(remote_exec_output "bash /tmp/remote-setup.sh --setup-kernel 2>&1") || SETUP_EXIT=$?
+spinner_stop
 
 # Выводим результаты проверки
-echo "${SETUP_OUTPUT}" | grep -E '(✔|✘|WARN|ERROR)' | while IFS= read -r line; do
+echo "${SETUP_OUTPUT}" | grep -E '\[(SETUP|WARN)\]' | while IFS= read -r line; do
     if echo "${line}" | grep -q '✔'; then
         echo -e "  ${GREEN}${line}${NC}"
-    else
+    elif echo "${line}" | grep -q 'WARN\|✘'; then
         echo -e "  ${YELLOW}${line}${NC}"
+    else
+        echo -e "  ${DIM}${line}${NC}"
     fi
 done
 echo ""
@@ -431,14 +436,17 @@ fi
 header "Шаг 3.5: Обновление manage.sh на сервере"
 
 spinner_start "Обновляем manage.sh..."
-UPDATE_OUTPUT=$(remote_exec_output "bash /tmp/remote-setup.sh --update-manage") || {
-    spinner_stop
+UPDATE_EXIT=0
+UPDATE_OUTPUT=$(remote_exec_output "bash /tmp/remote-setup.sh --update-manage 2>&1") || UPDATE_EXIT=$?
+spinner_stop
+
+if [[ ${UPDATE_EXIT} -ne 0 ]]; then
     warn "Не удалось обновить manage.sh (продолжаем — используется старая версия)."
     echo -e "${DIM}Вывод сервера:${NC}"
     echo "${UPDATE_OUTPUT}" | tail -10
-}
-spinner_stop
-success "manage.sh обновлён."
+else
+    success "manage.sh обновлён."
+fi
 
 # ==============================================================================
 # ШАГ 4: Запрашиваем имя нового VPN-клиента
