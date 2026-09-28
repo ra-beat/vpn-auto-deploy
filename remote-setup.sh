@@ -130,16 +130,24 @@ H4=$(( (RANDOM + 7) * (RANDOM + 8) + 400 ))
 log "Параметры: Jc=${JC}, Jmin=${JMIN}, Jmax=${JMAX}, S1=${S1}, S2=${S2}"
 
 # ==============================================================================
-# 7. Определяем публичный IP сервера
+# 7. Определяем публичный IPv4-адрес сервера
+#    ВАЖНО: используем только IPv4 (флаг -4). IPv6 не используется.
 # ==============================================================================
-log "Определяем публичный IP сервера..."
+log "Определяем публичный IPv4-адрес сервера..."
 PUBLIC_IP=""
-for srv in "ifconfig.me" "api.ipify.org" "icanhazip.com" "ipinfo.io/ip"; do
-    PUBLIC_IP=$(curl -s --max-time 5 "https://${srv}" 2>/dev/null | tr -d '[:space:]') || true
-    [[ -n "${PUBLIC_IP}" ]] && break
+for srv in "api4.ipify.org" "ipv4.icanhazip.com" "ifconfig.me" "api.ipify.org"; do
+    PUBLIC_IP=$(curl -4 -s --max-time 5 "https://${srv}" 2>/dev/null | tr -d '[:space:]') || true
+    # Проверяем что получили именно IPv4 (не IPv6)
+    if [[ "${PUBLIC_IP}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        break
+    fi
+    PUBLIC_IP=""
 done
-[[ -z "${PUBLIC_IP}" ]] && PUBLIC_IP=$(hostname -I | awk '{print $1}')
-log "Публичный IP сервера: ${PUBLIC_IP}"
+# Fallback: берём первый IPv4 из списка адресов хоста
+[[ -z "${PUBLIC_IP}" ]] && PUBLIC_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '/src/{print $NF}' | head -1)
+[[ -z "${PUBLIC_IP}" ]] && PUBLIC_IP=$(hostname -I | tr ' ' '\n' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | head -1)
+[[ -z "${PUBLIC_IP}" ]] && err "Не удалось определить публичный IPv4-адрес сервера."
+log "Публичный IPv4 сервера: ${PUBLIC_IP}"
 
 # ==============================================================================
 # 8. Создаём конфиг сервера wg0.conf с параметрами AmneziaWG
@@ -217,45 +225,90 @@ log "server.env создан."
 log "Создаём Dockerfile для AmneziaWG..."
 
 cat > "${VPN_DIR}/Dockerfile" << 'DOCKERFILE_EOF'
-FROM ubuntu:22.04
+# ── Стадия сборки: компилируем awg и awg-quick из исходников ──────────────────
+# Сборка из исходников — единственный надёжный способ: не зависит от
+# формата имён релизных пакетов на GitHub и гарантирует актуальную версию.
+FROM ubuntu:22.04 AS builder
 
 LABEL org.opencontainers.image.description="AmneziaWG VPN Server"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Устанавливаем системные зависимости
-RUN apt-get update && apt-get install -y \
+# Инструменты для сборки C-кода и git для клонирования репозитория
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Клонируем amneziawg-tools (форк wireguard-tools с поддержкой AWG-параметров)
+# --depth 1 — только последний коммит, не тянем историю
+#
+# ВАЖНО: Makefile собирает бинарник с именем 'wg' (не 'awg'),
+# поэтому мы используем 'make install DESTDIR' и нормализуем имена.
+RUN git clone --depth 1 \
+        https://github.com/amnezia-vpn/amneziawg-tools.git \
+        /tmp/awg-src \
+    # Компилируем всё: бинарник + скрипт wg-quick/awg-quick
+    && make -C /tmp/awg-src/src \
+    # Устанавливаем в временный DESTDIR — это правильно раскладывает все файлы
+    && make -C /tmp/awg-src/src install DESTDIR=/tmp/awg-inst \
+    # Выводим список установленных файлов (для отладки)
+    && echo '=== Installed files ===' && find /tmp/awg-inst -type f \
+    # Нормализуем имена в /tmp/awg-bin/: wg→awg, wg-quick→awg-quick
+    && mkdir -p /tmp/awg-bin \
+    # Ищем главный бинарник: сначала 'awg', затем 'wg'
+    && for f in awg wg; do \
+         found=$(find /tmp/awg-inst -type f -name "$f" ! -name '*-*' | head -1); \
+         [ -n "$found" ] && cp "$found" /tmp/awg-bin/awg && break; \
+       done \
+    # Ищем скрипт: сначала 'awg-quick', затем 'wg-quick'
+    && for f in awg-quick wg-quick; do \
+         found=$(find /tmp/awg-inst -type f -name "$f" | head -1); \
+         [ -n "$found" ] && cp "$found" /tmp/awg-bin/awg-quick && break; \
+       done \
+    # Если awg-quick вообще не нашёлся — создаём минимальный враппер
+    && if [ ! -f /tmp/awg-bin/awg-quick ]; then \
+         printf '#!/bin/sh\nexec wg-quick "$@"\n' > /tmp/awg-bin/awg-quick; \
+         echo 'WARN: awg-quick not found, created fallback wrapper'; \
+       fi \
+    && strip /tmp/awg-bin/awg \
+    && chmod +x /tmp/awg-bin/awg /tmp/awg-bin/awg-quick \
+    && echo '=== Final binaries ===' && ls -la /tmp/awg-bin/
+
+# ── Финальный образ: только рантайм-зависимости ──────────────────────────────
+# Компилятор и git не включаются — финальный образ остаётся лёгким.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Рантайм: сетевые утилиты и iptables для NAT
+RUN apt-get update && apt-get install -y --no-install-recommends \
         iptables \
         iproute2 \
         wireguard-tools \
-        curl \
         kmod \
         bash \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем amneziawg-tools из официальных GitHub Releases
-# amneziawg-tools предоставляет команды: awg, awg-quick
-RUN set -ex; \
-    ARCH=$(dpkg --print-architecture); \
-    LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/amnezia-vpn/amneziawg-tools/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'); \
-    VERSION="${LATEST_TAG#v}"; \
-    PKG_URL="https://github.com/amnezia-vpn/amneziawg-tools/releases/download/${LATEST_TAG}/amneziawg-tools_${VERSION}_${ARCH}.deb"; \
-    echo "Скачиваем ${PKG_URL}"; \
-    curl -fsSL "${PKG_URL}" -o /tmp/awg-tools.deb; \
-    dpkg -i /tmp/awg-tools.deb || apt-get install -f -y; \
-    rm -f /tmp/awg-tools.deb; \
-    awg --version || echo "awg установлен"
+# Копируем нормализованные бинарники из стадии builder:
+# awg       — основной бинарник (аналог wg, с поддержкой Jc/Jmin/Jmax/S1/S2/H1-H4)
+# awg-quick — скрипт управления интерфейсом (аналог wg-quick, читает AWG-поля)
+COPY --from=builder /tmp/awg-bin/awg       /usr/local/bin/awg
+COPY --from=builder /tmp/awg-bin/awg-quick  /usr/local/bin/awg-quick
+RUN chmod +x /usr/local/bin/awg /usr/local/bin/awg-quick \
+    && echo 'awg version:' && awg --version || true
 
 # Копируем точку входа контейнера
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Конфиги монтируются снаружи
+# Конфиги монтируются снаружи (с хоста)
 VOLUME ["/etc/amnezia/amneziawg"]
 
-# AmneziaWG слушает на UDP-порту
+# AmneziaWG слушает на UDP-порту (при network_mode: host порт открыт на хосте)
 EXPOSE 51820/udp
 
 ENTRYPOINT ["/entrypoint.sh"]
@@ -331,7 +384,11 @@ log "entrypoint.sh создан."
 log "Создаём docker-compose.yml..."
 
 cat > "${VPN_DIR}/docker-compose.yml" << COMPOSE_EOF
-version: "3.8"
+# docker-compose.yml для AmneziaWG
+# Примечание: поле 'version' удалено — оно устарело в Docker Compose v2+
+# Примечание: sysctls НЕ используются при network_mode: host
+#   (Docker запрещает менять sysctl хостового namespace через compose).
+#   IP-форвардинг включается напрямую через sysctl на хосте в remote-setup.sh.
 
 services:
   ${CONTAINER_NAME}:
@@ -343,26 +400,23 @@ services:
     container_name: ${CONTAINER_NAME}
     restart: unless-stopped
 
-    # host-сеть: контейнер видит хостовые интерфейсы напрямую,
-    # wg0 создаётся в пространстве имён хоста — не нужны явные port mappings
+    # host-сеть: контейнер разделяет сетевой namespace хоста напрямую.
+    # wg0 создаётся на хосте — входящий UDP:51820 сразу видит интерфейс.
+    # Явный port mapping не нужен.
     network_mode: host
 
-    # Привилегированный режим для работы с сетевыми интерфейсами и модулями ядра
+    # Привилегированный режим: нужен для создания сетевых интерфейсов
+    # и загрузки модулей ядра (modprobe amneziawg/wireguard)
     privileged: true
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
 
     volumes:
-      # Конфиги монтируем с хоста в контейнер
+      # Конфиги монтируем с хоста в контейнер (wg0.conf читается awg-quick)
       - /opt/my-vpn/wg-config:/etc/amnezia/amneziawg
-      # Модули ядра хоста (только чтение — нужны для modprobe)
+      # Модули ядра хоста — только чтение, нужны для modprobe
       - /lib/modules:/lib/modules:ro
-
-    sysctls:
-      # Форвардинг пакетов внутри контейнера (дополнение к хостовому)
-      - net.ipv4.ip_forward=1
-      - net.ipv4.conf.all.forwarding=1
 
     logging:
       driver: "json-file"
@@ -428,11 +482,12 @@ cat > "${VPN_DIR}/manage.sh" << 'MANAGE_SCRIPT_EOF'
 set -euo pipefail
 
 VPN_DIR="/opt/my-vpn"
-CLIENT_DIR="${VPN_DIR}/clients"
+CLIENT_DIR="${VPN_DIR}/clients"         # Готовые .conf и .png файлы
+KEYS_DIR="${VPN_DIR}/keys"              # Ключи клиентов (каждый в своей поддиректории)
 WG_CONF="${VPN_DIR}/wg-config/wg0.conf"
 ENV_FILE="${VPN_DIR}/server.env"
-LAST_IP_FILE="${VPN_DIR}/.last_client_octet"   # Файл-счётчик последнего выданного IP
-CONTAINER_NAME="amnezia-wg"                    # Имя контейнера (должно совпадать с docker-compose)
+LAST_IP_FILE="${VPN_DIR}/.last_client_octet"
+CONTAINER_NAME="amnezia-wg"
 
 log()  { echo "[MANAGE] $*"; }
 warn() { echo "[WARN]   $*"; }
@@ -449,17 +504,17 @@ CLIENT_NAME="$1"
 source "${ENV_FILE}"
 
 mkdir -p "${CLIENT_DIR}"
+mkdir -p "${KEYS_DIR}"
 
 log "Создаём клиента: ${CLIENT_NAME}"
 
 # ── Проверяем: не существует ли уже такой клиент ────────────────────────────
 if [[ -f "${CLIENT_DIR}/${CLIENT_NAME}.conf" ]]; then
-    warn "Клиент '${CLIENT_NAME}' уже существует: ${CLIENT_DIR}/${CLIENT_NAME}.conf"
-    warn "Перезаписываем конфиг (ключи будут пересозданы, добавлен новый пир)."
+    warn "Клиент '${CLIENT_NAME}' уже существует."
+    warn "Пересоздаём ключи и конфиг."
 fi
 
 # ── Выдаём следующий свободный IP-адрес из пула ──────────────────────────────
-# Сервер занимает 10.8.0.1, клиенты получают .2, .3, .4 и т.д.
 if [[ ! -f "${LAST_IP_FILE}" ]]; then
     LAST_OCTET=1
 else
@@ -474,12 +529,39 @@ echo "${NEXT_OCTET}" > "${LAST_IP_FILE}"
 log "IP клиента внутри туннеля: ${CLIENT_TUNNEL_IP}"
 
 # ── Генерируем ключи клиента ─────────────────────────────────────────────────
-# Ключи WireGuard (Curve25519) полностью совместимы с AmneziaWG
 log "Генерируем ключи..."
 CLIENT_PRIVKEY=$(wg genkey)
 CLIENT_PUBKEY=$(echo "${CLIENT_PRIVKEY}" | wg pubkey)
-CLIENT_PSK=$(wg genpsk)       # Предварительно согласованный ключ (дополнительный уровень защиты)
+CLIENT_PSK=$(wg genpsk)
 log "Ключи клиента сгенерированы."
+
+# ── Сохраняем ключи клиента в директорию keys/<client_name>/ ─────────────────
+# Каждый клиент получает свою поддиректорию с отдельными файлами для ключей.
+# Это позволяет легко ротировать или отозвать конкретный ключ.
+CLIENT_KEYS_DIR="${KEYS_DIR}/${CLIENT_NAME}"
+mkdir -p "${CLIENT_KEYS_DIR}"
+
+# Приватный ключ — самое чувствительное, права только для root
+echo "${CLIENT_PRIVKEY}" > "${CLIENT_KEYS_DIR}/private.key"
+chmod 600 "${CLIENT_KEYS_DIR}/private.key"
+
+# Публичный ключ — можно читать, нужен для добавления пира на сервере
+echo "${CLIENT_PUBKEY}" > "${CLIENT_KEYS_DIR}/public.key"
+chmod 644 "${CLIENT_KEYS_DIR}/public.key"
+
+# Предварительно согласованный ключ — также чувствительный
+echo "${CLIENT_PSK}" > "${CLIENT_KEYS_DIR}/preshared.key"
+chmod 600 "${CLIENT_KEYS_DIR}/preshared.key"
+
+# Метаданные клиента (IP, дата создания)
+cat > "${CLIENT_KEYS_DIR}/info.txt" << META_EOF
+client_name=${CLIENT_NAME}
+tunnel_ip=${CLIENT_TUNNEL_IP}
+created=$(date '+%Y-%m-%d %H:%M:%S')
+server_ip=${PUBLIC_IP}
+META_EOF
+
+log "Ключи сохранены: ${CLIENT_KEYS_DIR}/"
 
 # ── Добавляем пира в серверный конфиг wg0.conf ───────────────────────────────
 log "Добавляем [Peer] в wg0.conf..."
@@ -488,11 +570,8 @@ cat >> "${WG_CONF}" << PEER_EOF
 
 # ── Клиент: ${CLIENT_NAME} (добавлен: $(date '+%Y-%m-%d %H:%M:%S')) ──
 [Peer]
-# Публичный ключ клиента
 PublicKey = ${CLIENT_PUBKEY}
-# Предварительно согласованный ключ (PFS)
 PresharedKey = ${CLIENT_PSK}
-# Разрешённый IP клиента внутри туннеля
 AllowedIPs = ${CLIENT_TUNNEL_IP}/32
 PEER_EOF
 
@@ -501,8 +580,6 @@ log "Пир добавлен в конфиг."
 # ── Применяем конфиг сервера без обрыва существующих соединений ──────────────
 log "Применяем новую конфигурацию..."
 
-# Метод 1: awg syncconf — "горячее" добавление пира без сброса сессий
-# Стрипуем PostUp/PostDown перед syncconf (они не нужны для syncconf)
 if docker exec "${CONTAINER_NAME}" command -v awg &>/dev/null 2>&1; then
     docker exec "${CONTAINER_NAME}" bash -c \
         'awg syncconf wg0 <(awg-quick strip /etc/amnezia/amneziawg/wg0.conf)' \
@@ -511,10 +588,8 @@ if docker exec "${CONTAINER_NAME}" command -v awg &>/dev/null 2>&1; then
             warn "awg syncconf не сработал, перезапускаем контейнер..."
             docker restart "${CONTAINER_NAME}"
             sleep 5
-            log "Контейнер перезапущен."
         }
 elif docker exec "${CONTAINER_NAME}" command -v wg &>/dev/null 2>&1; then
-    # Fallback: стандартный wg syncconf (если awg недоступен)
     docker exec "${CONTAINER_NAME}" bash -c \
         'wg syncconf wg0 <(wg-quick strip /etc/amnezia/amneziawg/wg0.conf)' \
         && log "wg syncconf применён." \
@@ -524,52 +599,55 @@ elif docker exec "${CONTAINER_NAME}" command -v wg &>/dev/null 2>&1; then
             sleep 5
         }
 else
-    # Последний резерв: просто перезапускаем контейнер
-    warn "awg/wg не найдены в контейнере — перезапускаем контейнер."
+    warn "awg/wg не найдены в контейнере — перезапускаем."
     docker restart "${CONTAINER_NAME}"
     sleep 5
 fi
 
-# ── Получаем список заблокированных IP с antifilter.download ─────────────────
-# Разделение трафика: только заблокированные ресурсы идут через VPN.
-# Это обеспечивает нормальную скорость для незаблокированных ресурсов.
-log "Получаем список заблокированных IP с antifilter.download..."
+# ── Устанавливаем qrencode (нужен для генерации QR-кода) ─────────────────────
+if ! command -v qrencode &>/dev/null; then
+    log "Устанавливаем qrencode..."
+    apt-get install -y -qq qrencode
+fi
 
+# ── Получаем список заблокированных IP с antifilter.download ─────────────────
+log "Получаем список заблокированных IP с antifilter.download..."
 ALLOWED_IPS=""
 
-# Пробуем JSON API (возвращает массив ["ip1","ip2",...])
-ANTIFILTER_JSON=$(curl -s --max-time 45 \
-    "https://antifilter.download/api/ips" 2>/dev/null || echo "")
+# Сначала пробуем текстовый список (более стабилен)
+ALLOWED_IPS=$(curl -s --max-time 60 \
+    "https://antifilter.download/list/ips.txt" 2>/dev/null \
+    | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' \
+    | paste -sd ',' - || echo "")
 
-if [[ -n "${ANTIFILTER_JSON}" ]] && echo "${ANTIFILTER_JSON}" | grep -qE '^\['; then
-    # Парсим JSON-массив: убираем [], кавычки, переводы строк → CSV
-    ALLOWED_IPS=$(echo "${ANTIFILTER_JSON}" \
-        | tr -d '[]"' \
-        | tr ',' '\n' \
-        | grep -E '^[0-9]{1,3}\.[0-9]{1,3}' \
-        | paste -sd ',' -)
-    log "Получен JSON-список: $(echo "${ALLOWED_IPS}" | tr ',' '\n' | wc -l) записей."
+if [[ -n "${ALLOWED_IPS}" ]]; then
+    log "Текстовый список загружен: $(echo "${ALLOWED_IPS}" | tr ',' '\n' | wc -l) записей."
 fi
 
-# Если JSON не сработал — используем текстовый список
+# Если текстовый список не сработал — пробуем JSON API
 if [[ -z "${ALLOWED_IPS}" ]]; then
-    warn "JSON API недоступен. Пробуем текстовый список..."
-    ALLOWED_IPS=$(curl -s --max-time 45 \
-        "https://antifilter.download/list/ips.txt" 2>/dev/null \
-        | grep -E '^[0-9]{1,3}\.[0-9]{1,3}' \
-        | paste -sd ',' - || echo "")
-    [[ -n "${ALLOWED_IPS}" ]] && \
-        log "Текстовый список: $(echo "${ALLOWED_IPS}" | tr ',' '\n' | wc -l) записей."
+    warn "Текстовый список недоступен. Пробуем JSON API..."
+    ANTIFILTER_JSON=$(curl -s --max-time 60 \
+        "https://antifilter.download/api/ips" 2>/dev/null || echo "")
+
+    if [[ -n "${ANTIFILTER_JSON}" ]] && echo "${ANTIFILTER_JSON}" | grep -qE '^\['; then
+        ALLOWED_IPS=$(echo "${ANTIFILTER_JSON}" \
+            | tr -d '[]"' \
+            | tr ',' '\n' \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' \
+            | paste -sd ',' -)
+        [[ -n "${ALLOWED_IPS}" ]] && \
+            log "JSON API: $(echo "${ALLOWED_IPS}" | tr ',' '\n' | wc -l) записей."
+    fi
 fi
 
-# Если оба варианта не сработали — fallback на весь трафик через VPN
 if [[ -z "${ALLOWED_IPS}" ]]; then
-    warn "antifilter.download недоступен. Весь трафик будет идти через VPN."
+    warn "antifilter.download недоступен. Весь трафик идёт через VPN."
     ALLOWED_IPS="0.0.0.0/0"
 fi
 
 # ── Генерируем клиентский .conf файл ─────────────────────────────────────────
-log "Генерируем клиентский конфиг: ${CLIENT_DIR}/${CLIENT_NAME}.conf"
+log "Генерируем клиентский конфиг..."
 
 cat > "${CLIENT_DIR}/${CLIENT_NAME}.conf" << CLIENT_CONF_EOF
 # ==============================================================================
@@ -579,16 +657,13 @@ cat > "${CLIENT_DIR}/${CLIENT_NAME}.conf" << CLIENT_CONF_EOF
 # ==============================================================================
 
 [Interface]
-# Приватный ключ клиента (СЕКРЕТ — не передавать никому)
 PrivateKey = ${CLIENT_PRIVKEY}
-# IP-адрес клиента внутри VPN-туннеля
-Address = ${CLIENT_TUNNEL_IP}/24
-# DNS-серверы: используем Cloudflare и Google (можно заменить на 8.8.8.8)
+# Адрес клиента внутри VPN-туннеля (маска /32 — только этот адрес)
+Address = ${CLIENT_TUNNEL_IP}/32
 DNS = 1.1.1.1, 8.8.8.8
 
 # ── Параметры обфускации AmneziaWG ──────────────────────────────────────────
 # Эти значения ДОЛЖНЫ совпадать с серверными!
-# Они задают параметры маскировки трафика под случайные UDP-пакеты
 Jc = ${JC}
 Jmin = ${JMIN}
 Jmax = ${JMAX}
@@ -600,27 +675,100 @@ H3 = ${H3}
 H4 = ${H4}
 
 [Peer]
-# Публичный ключ сервера
 PublicKey = ${SERVER_PUBKEY}
-# Предварительно согласованный ключ (дополнительная защита сессии)
 PresharedKey = ${CLIENT_PSK}
-# Адрес и порт AmneziaWG-сервера
 Endpoint = ${PUBLIC_IP}:${WG_PORT}
-# ── Разделение трафика (Split Tunneling) ────────────────────────────────────
-# Только IP-адреса из списка заблокированных ресурсов идут через VPN.
-# Незаблокированные сайты используют прямое подключение → лучшая скорость.
-# Источник: antifilter.download (обновляется ежедневно)
 AllowedIPs = ${CLIENT_TUNNEL_IP}/32, ${ALLOWED_IPS}
-# Keepalive — поддерживает соединение через NAT/файрволы каждые 25 сек
 PersistentKeepalive = 25
 CLIENT_CONF_EOF
 
 chmod 600 "${CLIENT_DIR}/${CLIENT_NAME}.conf"
-log "Конфиг клиента готов: ${CLIENT_DIR}/${CLIENT_NAME}.conf"
+log "Конфиг сохранён: ${CLIENT_DIR}/${CLIENT_NAME}.conf"
+
+# ── Генерируем конфиг совместимости со стандартным WireGuard (для NekoBox и др.) ──
+# NekoBox / SagerNet / wg-android НЕ понимают поля Jc/Jmin/Jmax/S1/S2/H1-H4
+# Создаём чистый WireGuard конфиг без AWG-параметров обфускации
+log "Генерируем WireGuard-совместимый конфиг (для NekoBox/SagerNet)..."
+
+cat > "${CLIENT_DIR}/${CLIENT_NAME}_wg.conf" << WG_CONF_EOF
+# ==============================================================================
+# WireGuard конфигурация для клиента: ${CLIENT_NAME}
+# Сгенерирована: $(date '+%Y-%m-%d %H:%M:%S')
+# Сервер: ${PUBLIC_IP}
+# ПРИМЕЧАНИЕ: Этот файл БЕЗ параметров обфускации AmneziaWG.
+# Используйте для: NekoBox, SagerNet, wg-android, стандартных WG-клиентов.
+# Для обфускации используйте основной файл ${CLIENT_NAME}.conf в AmneziaVPN.
+# ==============================================================================
+
+[Interface]
+PrivateKey = ${CLIENT_PRIVKEY}
+Address = ${CLIENT_TUNNEL_IP}/32
+DNS = 1.1.1.1, 8.8.8.8
+
+[Peer]
+PublicKey = ${SERVER_PUBKEY}
+PresharedKey = ${CLIENT_PSK}
+Endpoint = ${PUBLIC_IP}:${WG_PORT}
+AllowedIPs = ${CLIENT_TUNNEL_IP}/32, ${ALLOWED_IPS}
+PersistentKeepalive = 25
+WG_CONF_EOF
+
+chmod 600 "${CLIENT_DIR}/${CLIENT_NAME}_wg.conf"
+log "WireGuard конфиг сохранён: ${CLIENT_DIR}/${CLIENT_NAME}_wg.conf"
+
+# ── Генерируем QR-код из конфига ─────────────────────────────────────────────
+# PNG-файл: импортируется в мобильных приложениях через камеру
+# ASCII QR: отображается прямо в терминале для быстрого сканирования
+
+log "Генерируем QR-код..."
+
+# PNG — сохраняем рядом с .conf, скачивается вместе с ним
+qrencode \
+    --type=PNG \
+    --size=10 \
+    --margin=2 \
+    --output="${CLIENT_DIR}/${CLIENT_NAME}.png" \
+    < "${CLIENT_DIR}/${CLIENT_NAME}.conf"
+
+chmod 600 "${CLIENT_DIR}/${CLIENT_NAME}.png"
+log "QR PNG сохранён: ${CLIENT_DIR}/${CLIENT_NAME}.png"
+
+# QR для WG-совместимого конфига (для NekoBox)
+qrencode \
+    --type=PNG \
+    --size=10 \
+    --margin=2 \
+    --output="${CLIENT_DIR}/${CLIENT_NAME}_wg.png" \
+    < "${CLIENT_DIR}/${CLIENT_NAME}_wg.conf" 2>/dev/null || true
+
+chmod 600 "${CLIENT_DIR}/${CLIENT_NAME}_wg.png" 2>/dev/null || true
+
+# ASCII QR — печатаем в терминал для мгновенного сканирования телефоном
+echo ""
+echo "[MANAGE] ── QR-код для импорта в AmneziaVPN (AWG) ──────────────"
+qrencode \
+    --type=ANSIUTF8 \
+    --margin=1 \
+    < "${CLIENT_DIR}/${CLIENT_NAME}.conf"
+echo "[MANAGE] ────────────────────────────────────────────────────────"
+echo ""
+echo "[MANAGE] ── QR-код для NekoBox / WireGuard (без обфускации) ─────"
+qrencode \
+    --type=ANSIUTF8 \
+    --margin=1 \
+    < "${CLIENT_DIR}/${CLIENT_NAME}_wg.conf"
+echo "[MANAGE] ────────────────────────────────────────────────────────"
+echo ""
+
+# ── Итоговая сводка ───────────────────────────────────────────────────────────
 log "=================================================="
 log "  Клиент '${CLIENT_NAME}' успешно добавлен!"
-log "  IP в туннеле: ${CLIENT_TUNNEL_IP}"
-log "  Конфиг: ${CLIENT_DIR}/${CLIENT_NAME}.conf"
+log "  IP в туннеле : ${CLIENT_TUNNEL_IP}"
+log "  Конфиг AWG   : ${CLIENT_DIR}/${CLIENT_NAME}.conf"
+log "  Конфиг WG    : ${CLIENT_DIR}/${CLIENT_NAME}_wg.conf  (для NekoBox)"
+log "  QR PNG (AWG) : ${CLIENT_DIR}/${CLIENT_NAME}.png"
+log "  QR PNG (WG)  : ${CLIENT_DIR}/${CLIENT_NAME}_wg.png   (для NekoBox)"
+log "  Ключи        : ${CLIENT_KEYS_DIR}/"
 log "=================================================="
 MANAGE_SCRIPT_EOF
 # ── manage.sh заканчивается здесь ────────────────────────────────────────────

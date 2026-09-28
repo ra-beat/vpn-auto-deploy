@@ -413,10 +413,12 @@ success "Конфигурация для '${CLIENT_NAME}' сгенерирова
 # ==============================================================================
 # ШАГ 6: Скачиваем .conf файл на локальную машину
 # ==============================================================================
-header "Шаг 6: Скачивание конфигурации"
+header "Шаг 6: Скачивание конфигурации и QR-кода"
 
 LOCAL_CONF="${SCRIPT_DIR}/${CLIENT_NAME}.conf"
+LOCAL_QR="${SCRIPT_DIR}/${CLIENT_NAME}.png"
 
+# Скачиваем .conf файл
 spinner_start "Скачиваем ${CLIENT_NAME}.conf..."
 if ! remote_scp_get "/opt/my-vpn/clients/${CLIENT_NAME}.conf" "${LOCAL_CONF}"; then
     spinner_stop
@@ -424,6 +426,88 @@ if ! remote_scp_get "/opt/my-vpn/clients/${CLIENT_NAME}.conf" "${LOCAL_CONF}"; t
     exit 1
 fi
 spinner_stop
+success "Конфигурация скачана: ${LOCAL_CONF}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Скачиваем директорию keys/ клиента с сервера
+# ──────────────────────────────────────────────────────────────────────────────
+LOCAL_KEYS_DIR="${SCRIPT_DIR}/keys/${CLIENT_NAME}"
+mkdir -p "${LOCAL_KEYS_DIR}"
+
+spinner_start "Скачиваем ключи клиента keys/${CLIENT_NAME}/..."
+KEYS_OK=true
+for KEY_FILE in private.key public.key preshared.key info.txt; do
+    if ! remote_scp_get "/opt/my-vpn/keys/${CLIENT_NAME}/${KEY_FILE}" \
+                         "${LOCAL_KEYS_DIR}/${KEY_FILE}" 2>/dev/null; then
+        KEYS_OK=false
+    fi
+done
+spinner_stop
+
+if [[ "${KEYS_OK}" == "true" ]]; then
+    # Защищаем приватный ключ локально
+    chmod 600 "${LOCAL_KEYS_DIR}/private.key" "${LOCAL_KEYS_DIR}/preshared.key" 2>/dev/null || true
+    success "Ключи сохранены: ${LOCAL_KEYS_DIR}/"
+else
+    warn "Не удалось скачать все ключи (это не критично, конфиг уже скачан)."
+fi
+
+# Скачиваем QR PNG (может отсутствовать на старых инсталляциях — не критично)
+spinner_start "Скачиваем ${CLIENT_NAME}.png (QR-код AWG)..."
+if remote_scp_get "/opt/my-vpn/clients/${CLIENT_NAME}.png" "${LOCAL_QR}" 2>/dev/null; then
+    spinner_stop
+    success "QR PNG (AWG) скачан: ${LOCAL_QR}"
+else
+    spinner_stop
+    warn "QR PNG не найден на сервере (это не критично)."
+    LOCAL_QR=""
+fi
+
+# Скачиваем WireGuard-совместимый конфиг (для NekoBox / SagerNet)
+LOCAL_WG_CONF="${SCRIPT_DIR}/${CLIENT_NAME}_wg.conf"
+LOCAL_WG_QR="${SCRIPT_DIR}/${CLIENT_NAME}_wg.png"
+
+spinner_start "Скачиваем ${CLIENT_NAME}_wg.conf (для NekoBox)..."
+if remote_scp_get "/opt/my-vpn/clients/${CLIENT_NAME}_wg.conf" "${LOCAL_WG_CONF}" 2>/dev/null; then
+    spinner_stop
+    success "WireGuard конфиг скачан: ${LOCAL_WG_CONF}"
+else
+    spinner_stop
+    warn "WireGuard конфиг (_wg.conf) не найден — возможно старая версия manage.sh на сервере."
+    LOCAL_WG_CONF=""
+fi
+
+spinner_start "Скачиваем ${CLIENT_NAME}_wg.png (QR для NekoBox)..."
+if remote_scp_get "/opt/my-vpn/clients/${CLIENT_NAME}_wg.png" "${LOCAL_WG_QR}" 2>/dev/null; then
+    spinner_stop
+    success "QR PNG (WG/NekoBox) скачан: ${LOCAL_WG_QR}"
+else
+    spinner_stop
+    LOCAL_WG_QR=""
+fi
+
+# Печатаем ASCII QR прямо в терминал, если qrencode установлен локально
+if [[ -f "${LOCAL_CONF}" ]]; then
+    if command -v qrencode &>/dev/null; then
+        echo ""
+        echo -e "${BOLD}${CYAN}  ── QR-код для импорта в AmneziaVPN ──────────────────${NC}"
+        qrencode --type=ANSIUTF8 --margin=1 < "${LOCAL_CONF}"
+        echo -e "${BOLD}${CYAN}  ────────────────────────────────────────────────────${NC}"
+    else
+        # Пробуем извлечь QR из вывода серверного manage.sh (GEN_OUTPUT)
+        QR_LINES=$(echo "${GEN_OUTPUT}" | grep -A 200 'QR-код для импорта' | head -100 2>/dev/null || echo "")
+        if [[ -n "${QR_LINES}" ]]; then
+            echo ""
+            echo -e "${BOLD}${CYAN}  ── QR-код для импорта в AmneziaVPN ──────────────────${NC}"
+            echo "${QR_LINES}"
+            echo -e "${BOLD}${CYAN}  ────────────────────────────────────────────────────${NC}"
+        else
+            info "Установите qrencode локально для отображения QR в терминале:"
+            info "  Ubuntu/Debian: sudo apt install qrencode"
+            info "  macOS:         brew install qrencode"
+        fi
+    fi
+fi
 
 # ==============================================================================
 # ФИНАЛ
@@ -435,9 +519,23 @@ if [[ -f "${LOCAL_CONF}" ]]; then
     echo -e "${BOLD}${GREEN}║   ✔  VPN-клиент успешно создан!                         ║${NC}"
     echo -e "${BOLD}${GREEN}║                                                          ║${NC}"
     echo -e "${BOLD}${GREEN}║   Клиент : ${NC}${BOLD}${CLIENT_NAME}${NC}"
-    echo -e "${BOLD}${GREEN}║   Файл   : ${NC}${LOCAL_CONF}"
+    echo -e "${BOLD}${GREEN}║   Конфиг : ${NC}${LOCAL_CONF}"
+    if [[ -n "${LOCAL_QR:-}" && -f "${LOCAL_QR}" ]]; then
+    echo -e "${BOLD}${GREEN}║   QR PNG : ${NC}${LOCAL_QR}"
+    fi
+    if [[ -d "${LOCAL_KEYS_DIR:-}" ]]; then
+    echo -e "${BOLD}${GREEN}║   Ключи  : ${NC}${LOCAL_KEYS_DIR}/"
+    fi
+    if [[ -n "${LOCAL_WG_CONF:-}" && -f "${LOCAL_WG_CONF}" ]]; then
     echo -e "${BOLD}${GREEN}║                                                          ║${NC}"
-    echo -e "${BOLD}${GREEN}║   Импортируйте файл в приложение AmneziaVPN             ║${NC}"
+    echo -e "${BOLD}${GREEN}║   NekoBox / WireGuard (без обфускации):                 ║${NC}"
+    echo -e "${BOLD}${GREEN}║   WG конф: ${NC}${LOCAL_WG_CONF}"
+    fi
+    if [[ -n "${LOCAL_WG_QR:-}" && -f "${LOCAL_WG_QR}" ]]; then
+    echo -e "${BOLD}${GREEN}║   WG QR  : ${NC}${LOCAL_WG_QR}"
+    fi
+    echo -e "${BOLD}${GREEN}║                                                          ║${NC}"
+    echo -e "${BOLD}${GREEN}║   Импортируйте .conf или отсканируйте QR в AmneziaVPN   ║${NC}"
     echo -e "${BOLD}${GREEN}║   (iOS / Android / macOS / Windows / Linux)             ║${NC}"
     echo -e "${BOLD}${GREEN}║                                                          ║${NC}"
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
