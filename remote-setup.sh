@@ -21,14 +21,147 @@ err()  { echo "[ERROR] $*" >&2; exit 1; }
 # Запрет запуска не из-под root
 [[ "${EUID}" -ne 0 ]] && err "Скрипт должен запускаться от root."
 
+# ==============================================================================
+# РЕЖИМ --update-manage: только пересоздаём manage.sh, без полной установки.
+# Вызывается из local-deploy.sh при каждом запуске чтобы держать manage.sh актуальным.
+# ==============================================================================
+if [[ "${1:-}" == "--update-manage" ]]; then
+    log "Режим обновления manage.sh..."
+    [[ ! -f "${VPN_DIR}/server.env" ]] && err "server.env не найден в ${VPN_DIR}. Сначала выполните полную установку."
+
+    # ── Определяем IPv4 средствами ОС и исправляем server.env ────────────────
+    log "Определяем публичный IPv4 сервера..."
+    # ip -4 route get 8.8.8.8 — запрашивает IPv4-маршрут до 8.8.8.8,
+    # поле src — это исходящий IPv4-адрес сервера. Без внешних запросов.
+    CURRENT_IP=$(ip -4 route get 8.8.8.8 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    # Fallback: первый глобальный IPv4-адрес на интерфейсах
+    [[ -z "${CURRENT_IP}" ]] && CURRENT_IP=$(ip -4 addr show scope global \
+        | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+
+    if [[ -n "${CURRENT_IP}" ]]; then
+        SAVED_IP=$(grep '^PUBLIC_IP=' "${VPN_DIR}/server.env" | cut -d'"' -f2 || echo "")
+        if [[ "${SAVED_IP}" != "${CURRENT_IP}" ]]; then
+            log "Исправляем PUBLIC_IP в server.env: '${SAVED_IP}' → '${CURRENT_IP}'"
+            sed -i "s|^PUBLIC_IP=.*|PUBLIC_IP=\"${CURRENT_IP}\"|" "${VPN_DIR}/server.env"
+        else
+            log "PUBLIC_IP в server.env уже корректен: ${CURRENT_IP}"
+        fi
+    else
+        warn "Не удалось определить IPv4 — server.env не изменён."
+    fi
+
+    log "manage.sh будет пересоздан в ${VPN_DIR}/manage.sh"
+    UPDATE_MANAGE_ONLY=true
+
+elif [[ "${1:-}" == "--setup-kernel" ]]; then
+    # ==============================================================================
+    # РЕЖИМ --setup-kernel: проверяем и устанавливаем модуль ядра amneziawg,
+    # проверяем Docker-контейнер и интерфейс wg0.
+    # Вызывается из local-deploy.sh на каждом запуске.
+    # ==============================================================================
+    log "Режим проверки и настройки сервера..."
+    SETUP_OK=true
+
+    # ── 1. Модуль ядра amneziawg ─────────────────────────────────────────────
+    if lsmod | grep -q amneziawg; then
+        log "✔ Модуль amneziawg уже загружен."
+    else
+        log "Модуль amneziawg не загружен — устанавливаем..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            "linux-headers-$(uname -r)" build-essential git 2>&1 | tail -3
+
+        AWG_MODULE_DIR="/tmp/awg-module"
+        rm -rf "${AWG_MODULE_DIR}"
+        git clone --depth 1 \
+            https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git \
+            "${AWG_MODULE_DIR}" 2>&1 | tail -3
+
+        if make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules 2>&1 | tail -3 && \
+           make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules_install 2>&1 | tail -2; then
+            depmod -a
+            echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
+            if modprobe amneziawg; then
+                log "✔ Модуль amneziawg собран и загружен."
+            else
+                warn "✘ Сборка прошла, но modprobe amneziawg не сработал."
+                SETUP_OK=false
+            fi
+        else
+            warn "✘ Не удалось собрать модуль amneziawg (ядро: $(uname -r))."
+            SETUP_OK=false
+        fi
+    fi
+
+    # ── 2. Docker-контейнер ───────────────────────────────────────────────────
+    CONTAINER_STATUS=$(docker inspect --format='{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo "missing")
+    if [[ "${CONTAINER_STATUS}" == "running" ]]; then
+        log "✔ Контейнер ${CONTAINER_NAME} запущен."
+    else
+        log "Контейнер ${CONTAINER_NAME} не запущен (статус: ${CONTAINER_STATUS}) — поднимаем..."
+        cd "${VPN_DIR}"
+        if docker compose up -d 2>&1 | tail -5; then
+            sleep 5
+            log "✔ Контейнер поднят."
+        else
+            warn "✘ Не удалось запустить контейнер."
+            SETUP_OK=false
+        fi
+    fi
+
+    # ── 3. Интерфейс wg0 ─────────────────────────────────────────────────────
+    sleep 2
+    if ip link show wg0 &>/dev/null 2>&1; then
+        log "✔ Интерфейс wg0 активен."
+    else
+        log "Интерфейс wg0 не поднят — перезапускаем контейнер..."
+        docker restart "${CONTAINER_NAME}" 2>&1 | tail -3
+        sleep 5
+        if ip link show wg0 &>/dev/null 2>&1; then
+            log "✔ Интерфейс wg0 активен после перезапуска."
+        else
+            warn "✘ Интерфейс wg0 по-прежнему не поднят."
+            docker logs "${CONTAINER_NAME}" --tail 10
+            SETUP_OK=false
+        fi
+    fi
+
+    # ── 4. Порт UDP 51820 ─────────────────────────────────────────────────────
+    if ss -ulnp | grep -q ":51820"; then
+        log "✔ Порт UDP 51820 слушается."
+    else
+        warn "✘ Порт UDP 51820 не слушается — проверьте контейнер и firewall."
+        SETUP_OK=false
+    fi
+
+    # ── Итог ──────────────────────────────────────────────────────────────────
+    if [[ "${SETUP_OK}" == "true" ]]; then
+        log "=================================================="
+        log "  Сервер готов принимать VPN-подключения."
+        log "=================================================="
+        exit 0
+    else
+        warn "=================================================="
+        warn "  Сервер НЕ полностью готов. Проверьте вывод выше."
+        warn "=================================================="
+        exit 1
+    fi
+
+else
+    UPDATE_MANAGE_ONLY=false
+fi
+
 log "=================================================="
 log "  Начало установки AmneziaWG VPN"
 log "  $(date '+%Y-%m-%d %H:%M:%S')"
 log "=================================================="
 
 # ==============================================================================
-# Определяем основной сетевой интерфейс сервера (нужен для NAT)
+# Шаги 1–13: полная установка. Пропускаем в режиме --update-manage.
 # ==============================================================================
+if [[ "${UPDATE_MANAGE_ONLY}" == "false" ]]; then
+
+# Определяем основной сетевой интерфейс сервера (нужен для NAT)
 IFACE=$(ip route get 8.8.8.8 2>/dev/null \
     | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
 [[ -z "${IFACE}" ]] && err "Не удалось определить основной сетевой интерфейс."
@@ -48,6 +181,37 @@ apt-get install -y -qq \
     curl wget ca-certificates gnupg lsb-release \
     wireguard-tools iptables iptables-persistent \
     iproute2 kmod jq
+
+# ==============================================================================
+# 1а. Собираем и устанавливаем модуль ядра amneziawg
+#     Это ОБЯЗАТЕЛЬНЫЙ шаг — без этого модуля сервер не может создать
+#     интерфейс типа amneziawg и AWG-обфускация не работает.
+# ==============================================================================
+log "Устанавливаем заголовки ядра и инструменты сборки..."
+apt-get install -y -qq \
+    "linux-headers-$(uname -r)" \
+    build-essential git
+
+log "Клонируем и собираем модуль amneziawg..."
+AWG_MODULE_DIR="/tmp/awg-module"
+rm -rf "${AWG_MODULE_DIR}"
+git clone --depth 1 \
+    https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git \
+    "${AWG_MODULE_DIR}"
+
+if make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules 2>&1 | tail -5; then
+    make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules_install
+    depmod -a
+    # Загружаем модуль немедленно
+    modprobe amneziawg && log "Модуль amneziawg успешно загружен." \
+        || warn "modprobe amneziawg не сработал после сборки — проверьте depmod."
+    # Автозагрузка при старте системы
+    echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
+    log "Модуль amneziawg добавлен в автозагрузку."
+else
+    warn "Не удалось собрать модуль amneziawg. AWG-обфускация может не работать."
+    warn "Убедитесь что linux-headers-$(uname -r) доступны для вашего ядра."
+fi
 
 # ==============================================================================
 # 2. Устанавливаем Docker (официальный скрипт get.docker.com)
@@ -130,23 +294,18 @@ H4=$(( (RANDOM + 7) * (RANDOM + 8) + 400 ))
 log "Параметры: Jc=${JC}, Jmin=${JMIN}, Jmax=${JMAX}, S1=${S1}, S2=${S2}"
 
 # ==============================================================================
-# 7. Определяем публичный IPv4-адрес сервера
-#    ВАЖНО: используем только IPv4 (флаг -4). IPv6 не используется.
+# 7. Определяем публичный IPv4-адрес сервера средствами ОС
+#    IPv6 не используется никогда.
 # ==============================================================================
-log "Определяем публичный IPv4-адрес сервера..."
-PUBLIC_IP=""
-for srv in "api4.ipify.org" "ipv4.icanhazip.com" "ifconfig.me" "api.ipify.org"; do
-    PUBLIC_IP=$(curl -4 -s --max-time 5 "https://${srv}" 2>/dev/null | tr -d '[:space:]') || true
-    # Проверяем что получили именно IPv4 (не IPv6)
-    if [[ "${PUBLIC_IP}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        break
-    fi
-    PUBLIC_IP=""
-done
-# Fallback: берём первый IPv4 из списка адресов хоста
-[[ -z "${PUBLIC_IP}" ]] && PUBLIC_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '/src/{print $NF}' | head -1)
-[[ -z "${PUBLIC_IP}" ]] && PUBLIC_IP=$(hostname -I | tr ' ' '\n' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | head -1)
-[[ -z "${PUBLIC_IP}" ]] && err "Не удалось определить публичный IPv4-адрес сервера."
+log "Определяем публичный IPv4 сервера..."
+# ip -4 route get 8.8.8.8 — запрашивает IPv4-маршрут до 8.8.8.8,
+# поле src — это исходящий IPv4-адрес сервера
+PUBLIC_IP=$(ip -4 route get 8.8.8.8 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+# Fallback: первый глобальный IPv4-адрес сервера
+[[ -z "${PUBLIC_IP}" ]] && PUBLIC_IP=$(ip -4 addr show scope global \
+    | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+[[ -z "${PUBLIC_IP}" ]] && err "Не удалось определить публичный IPv4. Проверьте наличие IPv4-адреса на сервере."
 log "Публичный IPv4 сервера: ${PUBLIC_IP}"
 
 # ==============================================================================
@@ -466,6 +625,8 @@ else
     warn "Интерфейс wg0 не обнаружен. Проверьте: docker logs ${CONTAINER_NAME}"
 fi
 
+fi  # end if UPDATE_MANAGE_ONLY == false
+
 # ==============================================================================
 # 14. Создаём скрипт управления /opt/my-vpn/manage.sh
 #     Этот скрипт отвечает за добавление новых VPN-клиентов
@@ -775,6 +936,15 @@ MANAGE_SCRIPT_EOF
 
 chmod +x "${VPN_DIR}/manage.sh"
 log "manage.sh создан и сделан исполняемым."
+
+# В режиме --update-manage завершаем работу здесь
+if [[ "${UPDATE_MANAGE_ONLY}" == "true" ]]; then
+    log "=================================================="
+    log "  manage.sh успешно обновлён!"
+    log "  ${VPN_DIR}/manage.sh"
+    log "=================================================="
+    exit 0
+fi
 
 # ==============================================================================
 # 15. Создаём файл-флаг успешной установки
