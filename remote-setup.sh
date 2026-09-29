@@ -67,28 +67,22 @@ elif [[ "${1:-}" == "--setup-kernel" ]]; then
     if lsmod | grep -q amneziawg; then
         log "✔ Модуль amneziawg уже загружен."
     else
-        log "Модуль amneziawg не загружен — устанавливаем..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            "linux-headers-$(uname -r)" build-essential git 2>&1 | tail -3
+        log "Модуль amneziawg не загружен — устанавливаем из PPA..."
+        apt-get update -qq
+        apt-get install -y -qq software-properties-common "linux-headers-$(uname -r)"
+        add-apt-repository ppa:amnezia/ppa -y >/dev/null 2>&1
+        apt-get update -qq
 
-        AWG_MODULE_DIR="/tmp/awg-module"
-        rm -rf "${AWG_MODULE_DIR}"
-        git clone --depth 1 \
-            https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git \
-            "${AWG_MODULE_DIR}" 2>&1 | tail -3
-
-        if make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules 2>&1 | tail -3 && \
-           make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules_install 2>&1 | tail -2; then
-            depmod -a
+        if apt-get install -y -qq amneziawg amneziawg-tools; then
             echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
             if modprobe amneziawg; then
-                log "✔ Модуль amneziawg собран и загружен."
+                log "✔ Модуль amneziawg установлен и загружен."
             else
-                warn "✘ Сборка прошла, но modprobe amneziawg не сработал."
+                warn "✘ Установка прошла, но modprobe amneziawg не сработал."
                 SETUP_OK=false
             fi
         else
-            warn "✘ Не удалось собрать модуль amneziawg (ядро: $(uname -r))."
+            warn "✘ Не удалось установить модуль amneziawg из PPA."
             SETUP_OK=false
         fi
     fi
@@ -187,30 +181,20 @@ apt-get install -y -qq \
 #     Это ОБЯЗАТЕЛЬНЫЙ шаг — без этого модуля сервер не может создать
 #     интерфейс типа amneziawg и AWG-обфускация не работает.
 # ==============================================================================
-log "Устанавливаем заголовки ядра и инструменты сборки..."
-apt-get install -y -qq \
-    "linux-headers-$(uname -r)" \
-    build-essential git
+log "Добавляем репозиторий PPA Amnezia и устанавливаем модуль..."
+apt-get install -y -qq software-properties-common "linux-headers-$(uname -r)"
+add-apt-repository ppa:amnezia/ppa -y >/dev/null 2>&1
+apt-get update -qq
 
-log "Клонируем и собираем модуль amneziawg..."
-AWG_MODULE_DIR="/tmp/awg-module"
-rm -rf "${AWG_MODULE_DIR}"
-git clone --depth 1 \
-    https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git \
-    "${AWG_MODULE_DIR}"
-
-if make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules 2>&1 | tail -5; then
-    make -C "/lib/modules/$(uname -r)/build" M="${AWG_MODULE_DIR}" modules_install
-    depmod -a
+if apt-get install -y -qq amneziawg amneziawg-tools; then
     # Загружаем модуль немедленно
     modprobe amneziawg && log "Модуль amneziawg успешно загружен." \
-        || warn "modprobe amneziawg не сработал после сборки — проверьте depmod."
+        || warn "modprobe amneziawg не сработал после установки."
     # Автозагрузка при старте системы
     echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
     log "Модуль amneziawg добавлен в автозагрузку."
 else
-    warn "Не удалось собрать модуль amneziawg. AWG-обфускация может не работать."
-    warn "Убедитесь что linux-headers-$(uname -r) доступны для вашего ядра."
+    warn "Не удалось установить модуль amneziawg из PPA. AWG-обфускация может не работать."
 fi
 
 # ==============================================================================
